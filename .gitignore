@@ -11,6 +11,10 @@ calculator/
 site/
 *.html
 
+# Publish snapshot site (calculator-style)
+!docs/
+!docs/index.html
+
 # Logs
 *.log
 *.err.log
