@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Cursor / local workspace artifacts
+.cursor/
+Context/
+calculator/
+
+# Generated dashboards / outputs (contain data)
+site/
+*.html
+
+# Logs
+*.log
+*.err.log
+
