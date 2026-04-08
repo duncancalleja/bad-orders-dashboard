@@ -172,34 +172,49 @@ class Filters:
         return self.end_date_inclusive + dt.timedelta(days=1)
 
 
-def _vendor_filter_sql(filters: Filters) -> str:
+def _vendor_filter_sql(filters: Filters, table_alias: str = "d") -> str:
+    t = table_alias
     if filters.vendor_ids:
         # Keep IN list sizes reasonable; vendor_id is int.
         ids = ",".join(str(int(x)) for x in filters.vendor_ids)
-        return f" AND vendor_id IN ({ids})\n"
+        return f" AND {t}.vendor_id IN ({ids})\n"
     if filters.vendor_names:
         names = ",".join(_sql_quote(x) for x in filters.vendor_names)
-        return f" AND TRIM(vendor_name) IN ({names})\n"
+        return f" AND TRIM({t}.vendor_name) IN ({names})\n"
     return ""
 
 
-def _base_where_sql(filters: Filters) -> str:
+def _from_order_with_provider_sql() -> str:
+    """Join orders to merchant dimension for account management (AM) assignment."""
+    return (
+        "FROM ng_delivery_spark.dim_order_delivery d\n"
+        "LEFT JOIN ng_delivery_spark.dim_provider_v2 p ON d.provider_id = p.provider_id\n"
+    )
+
+
+def _base_where_sql(filters: Filters, table_alias: str = "d") -> str:
+    t = table_alias
     return (
         "WHERE 1=1\n"
-        f"  AND country_code = {_sql_quote(filters.country_code.lower())}\n"
-        f"  AND order_created_date_local >= {_sql_quote(filters.start_date.isoformat())}\n"
-        f"  AND order_created_date_local < {_sql_quote(filters.end_date_exclusive.isoformat())}\n"
-        "  AND order_state IN ('delivered','failed','rejected')\n"
-        + _vendor_filter_sql(filters)
+        f"  AND {t}.country_code = {_sql_quote(filters.country_code.lower())}\n"
+        f"  AND {t}.order_created_date_local >= {_sql_quote(filters.start_date.isoformat())}\n"
+        f"  AND {t}.order_created_date_local < {_sql_quote(filters.end_date_exclusive.isoformat())}\n"
+        f"  AND {t}.order_state IN ('delivered','failed','rejected')\n"
+        + _vendor_filter_sql(filters, table_alias)
     )
 
 
 def _bad_orders_where_sql(filters: Filters) -> str:
     return (
         _base_where_sql(filters)
-        + "  AND is_bad_order = true\n"
-        + "  AND bad_order_actor_at_fault = 'provider'\n"
+        + "  AND d.is_bad_order = true\n"
+        + "  AND d.bad_order_actor_at_fault = 'provider'\n"
     )
+
+
+def _account_manager_sql() -> str:
+    """AM assignment from merchant master (team / bucket, not necessarily a person's name)."""
+    return "COALESCE(NULLIF(TRIM(p.account_management_segment), ''), 'Unknown')"
 
 
 def _reason_sql() -> str:
@@ -220,29 +235,46 @@ END
 def _query_accounts_sql(filters: Filters) -> str:
     return (
         "SELECT\n"
-        "  COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown') AS cohort,\n"
-        "  COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown') AS vendor_name\n"
-        "FROM ng_delivery_spark.dim_order_delivery\n"
+        "  COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
+        "  COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS vendor_name\n"
+        + _from_order_with_provider_sql()
         + _base_where_sql(filters)
-        + "GROUP BY COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown')\n"
-        + "ORDER BY vendor_name\n"
+        + "GROUP BY COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown')\n"
+        + "ORDER BY cohort\n"
     )
 
 
 def _query_detail_rows_sql(filters: Filters) -> str:
     reason = _reason_sql()
+    # Qualify columns with alias `d.` for join. `failed_order_reason` is a suffix of
+    # `manually_failed_order_reason`, so we must not substring-replace in the wrong order.
+    _ph = "__MANUALLY_FAILED_ORDER_REASON__"
+    reason_d = reason.replace("manually_failed_order_reason", _ph)
+    reason_d = reason_d.replace("bad_order_type", "d.bad_order_type")
+    for col in (
+        "failed_order_parent_reason",
+        "failed_order_reason",
+        "bad_order_main_reason",
+        "late_delivery_actor_at_fault_reason",
+        "missing_or_wrong_items_cs_ticket_types",
+        "order_quality_cs_ticket_types",
+        "timing_quality_cs_ticket_types",
+    ):
+        reason_d = reason_d.replace(col, f"d.{col}")
+    reason_d = reason_d.replace(_ph, "d.manually_failed_order_reason")
     return (
         "SELECT\n"
-        "  date_format(order_created_ts_local, 'yyyy-MM-dd HH:mm:ss') AS time,\n"
-        "  date_format(order_created_date_local, 'yyyy-MM') AS month,\n"
-        "  order_reference_id AS order_ref,\n"
-        "  provider_name AS provider,\n"
-        "  COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown') AS cohort,\n"
-        "  bad_order_type AS type,\n"
-        f"  {reason} AS reason\n"
-        "FROM ng_delivery_spark.dim_order_delivery\n"
+        "  date_format(d.order_created_ts_local, 'yyyy-MM-dd HH:mm:ss') AS time,\n"
+        "  date_format(d.order_created_date_local, 'yyyy-MM') AS month,\n"
+        "  d.order_reference_id AS order_ref,\n"
+        "  d.provider_name AS provider,\n"
+        "  COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
+        f"  {_account_manager_sql()} AS account_manager,\n"
+        "  d.bad_order_type AS type,\n"
+        f"  {reason_d} AS reason\n"
+        + _from_order_with_provider_sql()
         + _bad_orders_where_sql(filters)
-        + "ORDER BY order_created_ts_local DESC\n"
+        + "ORDER BY d.order_created_ts_local DESC\n"
     )
 
 
@@ -250,23 +282,27 @@ def _query_kpi_by_provider_sql(filters: Filters) -> str:
     return (
         "WITH base AS (\n"
         "  SELECT\n"
-        "    provider_name AS provider,\n"
-        "    COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown') AS cohort,\n"
+        "    d.provider_name AS provider,\n"
+        "    COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
+        f"    {_account_manager_sql()} AS account_manager,\n"
         "    COUNT(*) AS placed_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' THEN 1 ELSE 0 END) AS bad_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'failed_order_provider_rejected' THEN 1 ELSE 0 END) AS rejected_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'failed_order_after_provider_accepted' THEN 1 ELSE 0 END) AS dnr_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'late_delivery_order_15min' THEN 1 ELSE 0 END) AS late_15_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'missing_or_wrong_item_cs_ticket' THEN 1 ELSE 0 END) AS missing_wrong_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'order_quality_cs_ticket' THEN 1 ELSE 0 END) AS quality_ticket_orders,\n"
-        "    SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'timing_quality_cs_ticket' THEN 1 ELSE 0 END) AS timing_ticket_orders\n"
-        "  FROM ng_delivery_spark.dim_order_delivery\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' THEN 1 ELSE 0 END) AS bad_orders,\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'failed_order_provider_rejected' THEN 1 ELSE 0 END) AS rejected_orders,\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'failed_order_after_provider_accepted' THEN 1 ELSE 0 END) AS dnr_orders,\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'late_delivery_order_15min' THEN 1 ELSE 0 END) AS late_15_orders,\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'missing_or_wrong_item_cs_ticket' THEN 1 ELSE 0 END) AS missing_wrong_orders,\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'order_quality_cs_ticket' THEN 1 ELSE 0 END) AS quality_ticket_orders,\n"
+        "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'timing_quality_cs_ticket' THEN 1 ELSE 0 END) AS timing_ticket_orders\n"
+        + _from_order_with_provider_sql()
         + _base_where_sql(filters)
-        + "  GROUP BY provider_name, COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown')\n"
+        + "  GROUP BY d.provider_name, COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown'), "
+        + _account_manager_sql()
+        + "\n"
         ")\n"
         "SELECT\n"
         "  provider,\n"
         "  cohort,\n"
+        "  account_manager,\n"
         "  placed_orders,\n"
         "  bad_orders,\n"
         "  CASE WHEN placed_orders > 0 THEN bad_orders / placed_orders ELSE NULL END AS bad_rate,\n"
@@ -285,28 +321,47 @@ def _query_kpi_by_provider_sql(filters: Filters) -> str:
 def _query_rejection_data_sql(filters: Filters) -> str:
     return (
         "SELECT\n"
-        "  provider_name AS provider,\n"
-        "  COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown') AS cohort,\n"
-        "  date_format(order_created_date_local, 'yyyy-MM') AS month,\n"
+        "  d.provider_name AS provider,\n"
+        "  COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
+        f"  {_account_manager_sql()} AS account_manager,\n"
+        "  date_format(d.order_created_date_local, 'yyyy-MM') AS month,\n"
         "  COUNT(*) AS placed_orders,\n"
-        "  SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'failed_order_provider_rejected' THEN 1 ELSE 0 END) AS rejected,\n"
-        "  SUM(CASE WHEN is_bad_order = true AND bad_order_actor_at_fault = 'provider' AND bad_order_type = 'failed_order_after_provider_accepted' THEN 1 ELSE 0 END) AS dnr\n"
-        "FROM ng_delivery_spark.dim_order_delivery\n"
+        "  SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'failed_order_provider_rejected' THEN 1 ELSE 0 END) AS rejected,\n"
+        "  SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'failed_order_after_provider_accepted' THEN 1 ELSE 0 END) AS dnr\n"
+        + _from_order_with_provider_sql()
         + _base_where_sql(filters)
-        + "GROUP BY provider_name, COALESCE(NULLIF(TRIM(vendor_name), ''), 'Unknown'), date_format(order_created_date_local, 'yyyy-MM')\n"
+        + "GROUP BY d.provider_name, COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown'), "
+        + _account_manager_sql()
+        + ", date_format(d.order_created_date_local, 'yyyy-MM')\n"
         + "ORDER BY month DESC, rejected DESC\n"
     )
 
 
-def _html_template(title: str, account_options_html: str, month_options_html: str, data_json: str) -> str:
-    # Self-contained HTML. Chart.js is the only external dependency.
+def _chart_script_tag() -> str:
+    """Prefer vendored Chart.js (no CDN) for internal / Apps Script hosting."""
+    vendor = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", "chart.umd.min.js")
+    if os.path.isfile(vendor):
+        with open(vendor, "r", encoding="utf-8") as f:
+            body = f.read().replace("</script>", "<\\/script>")
+        return f"<script>\n{body}\n</script>"
+    return '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>'
+
+
+def _html_template(
+    title: str,
+    account_options_html: str,
+    am_options_html: str,
+    month_options_html: str,
+    data_json: str,
+) -> str:
+    # Self-contained HTML; Chart.js from vendor/ when present (otherwise CDN fallback).
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  {_chart_script_tag()}
   <style>
     :root {{
       --bolt-green: #2A9C64; --bolt-green-dark: #1e7a4d; --bolt-bg: #ffffff;
@@ -353,13 +408,18 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
 <body>
   <header>
     <h1>{title}</h1>
-    <div class="sub">Provider-at-fault bad orders from Databricks `ng_delivery_spark.dim_order_delivery`</div>
+    <div class="sub">Provider-at-fault bad orders — orders from `dim_order_delivery`; account management from `dim_provider_v2.account_management_segment` (AM assignment / team)</div>
   </header>
   <div class="wrap">
     <div class="filters">
       <label>Brand:
         <select id="brandSel">
           {account_options_html}
+        </select>
+      </label>
+      <label>Account management:
+        <select id="amSel">
+          {am_options_html}
         </select>
       </label>
       <label>Month:
@@ -378,11 +438,11 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
     <div id="tab-overview" class="tab-panel">
       <div class="kpi-grid" id="kpiOverview"></div>
       <div class="grid2">
-        <div class="panel"><h2>Bad orders by type (trend)</h2><canvas id="chTypeTrend"></canvas></div>
+        <div class="panel"><h2>Bad orders by type (trend)</h2><p class="sub" style="font-size:0.8rem;color:var(--bolt-muted);margin:-0.25rem 0 0.5rem">Hover a segment: count and % of bad orders in that month.</p><canvas id="chTypeTrend"></canvas></div>
         <div class="panel"><h2>Bad order rates (trend)</h2><canvas id="chSegTrend"></canvas></div>
       </div>
       <div class="grid2">
-        <div class="panel"><h2>Bad orders by type</h2><canvas id="chTypeBar"></canvas></div>
+        <div class="panel"><h2>Bad orders by type</h2><p class="sub" style="font-size:0.8rem;color:var(--bolt-muted);margin:-0.25rem 0 0.5rem">Labels show count and % of all bad orders in the current filters (Brand / Account management / Month).</p><canvas id="chTypeBar"></canvas></div>
         <div class="panel"><h2>Bad orders by provider</h2><canvas id="chProvBar"></canvas></div>
       </div>
       <div class="panel"><h2>Provider KPIs</h2><div style="overflow:auto" id="tableKpi"></div></div>
@@ -419,11 +479,39 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
   function humanize(s) {{ return s ? String(s).replace(/_/g, " ") : ""; }}
   function activeMonths() {{ const v = document.getElementById("monthSel").value; return v === "all" ? MONTHS : [v]; }}
   function activeBrand() {{ return document.getElementById("brandSel").value; }}
+  function activeAm() {{ return document.getElementById("amSel").value; }}
+  function rowAm(r) {{ return r.account_manager != null ? String(r.account_manager) : "Unknown"; }}
+  function matchesAm(r) {{ const a = activeAm(); return a === "all" || rowAm(r) === a; }}
 
   function filteredRows() {{
     const ms = activeMonths();
     const b = activeBrand();
-    return DATA.detail_rows.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b));
+    return DATA.detail_rows.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b) && matchesAm(r));
+  }}
+
+  /** Rate trend rows for selected brand + account management (computed client-side from raw rows). */
+  function buildSegmentTrendRows(ms) {{
+    const b = activeBrand();
+    const a = activeAm();
+    const rej = DATA.rejection_data.filter(r => (b === "all" || r.cohort === b) && (a === "all" || rowAm(r) === a));
+    const det = DATA.detail_rows.filter(r => (b === "all" || r.cohort === b) && (a === "all" || rowAm(r) === a));
+    return ms.map(m => {{
+      const rmonth = rej.filter(x => x.month === m);
+      const placed = rmonth.reduce((s, x) => s + (Number(x.placed_orders) || 0), 0);
+      const rejected = rmonth.reduce((s, x) => s + (Number(x.rejected) || 0), 0);
+      const dnr = rmonth.reduce((s, x) => s + (Number(x.dnr) || 0), 0);
+      const dm = det.filter(x => x.month === m);
+      const bad = dm.length;
+      const late15 = dm.filter(x => x.type === "late_delivery_order_15min").length;
+      const missing = dm.filter(x => x.type === "missing_or_wrong_item_cs_ticket").length;
+      return {{
+        month: m,
+        bad_rate: placed ? bad / placed : null,
+        not_delivered_rate: placed ? (rejected + dnr) / placed : null,
+        late_15_rate: placed ? late15 / placed : null,
+        missing_wrong_rate: placed ? missing / placed : null,
+      }};
+    }});
   }}
 
   let charts = {{}};
@@ -435,6 +523,11 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
     palette: ["#2A9C64","#e53935","#fb8c00","#1e88e5","#8e24aa","#00897b","#c0ca33","#6d4c41","#78909c","#ec407a","#26a69a","#5c6bc0","#ff7043"]
   }};
 
+  function typeCountShare(n, total) {{
+    if (!total) return fmtNum(n);
+    return fmtNum(n) + " · " + fmtPct(n / total);
+  }}
+
   function renderOverviewKpis() {{
     const rows = filteredRows();
     const types = {{}};
@@ -442,22 +535,22 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
     const el = document.getElementById("kpiOverview");
     const total = rows.length;
     const items = [
-      {{ label: "Total bad orders", val: total, cls: total > 1000 ? "bad" : (total > 300 ? "warn" : "") }},
-      {{ label: "Rejected / failed", val: types["failed_order_provider_rejected"] || 0 }},
-      {{ label: "Failed after accepted", val: types["failed_order_after_provider_accepted"] || 0 }},
-      {{ label: "Late delivery 15min+", val: types["late_delivery_order_15min"] || 0 }},
-      {{ label: "Missing / wrong item", val: types["missing_or_wrong_item_cs_ticket"] || 0 }},
-      {{ label: "Quality tickets", val: types["order_quality_cs_ticket"] || 0 }},
+      {{ label: "Total bad orders", val: fmtNum(total), cls: total > 1000 ? "bad" : (total > 300 ? "warn" : "") }},
+      {{ label: "Rejected / failed", val: typeCountShare(types["failed_order_provider_rejected"] || 0, total) }},
+      {{ label: "Failed after accepted", val: typeCountShare(types["failed_order_after_provider_accepted"] || 0, total) }},
+      {{ label: "Late delivery 15min+", val: typeCountShare(types["late_delivery_order_15min"] || 0, total) }},
+      {{ label: "Missing / wrong item", val: typeCountShare(types["missing_or_wrong_item_cs_ticket"] || 0, total) }},
+      {{ label: "Quality tickets", val: typeCountShare(types["order_quality_cs_ticket"] || 0, total) }},
     ];
     el.innerHTML = items.map(x =>
-      '<div class="kpi"><h3>' + x.label + '</h3><div class="val' + (x.cls ? ' ' + x.cls : '') + '">' + fmtNum(x.val) + '</div></div>'
+      '<div class="kpi"><h3>' + x.label + '</h3><div class="val' + (x.cls ? ' ' + x.cls : '') + '">' + x.val + '</div></div>'
     ).join("");
   }}
 
   function drawOverviewCharts() {{
     const ms = activeMonths();
     const b = activeBrand();
-    const allRows = DATA.detail_rows.filter(r => b === "all" || r.cohort === b);
+    const allRows = DATA.detail_rows.filter(r => (b === "all" || r.cohort === b) && matchesAm(r));
     const allTypes = [...new Set(allRows.map(r => r.type))];
 
     // Type trend
@@ -477,12 +570,28 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
           backgroundColor: C.palette[i % C.palette.length] + "cc"
         }}))
       }},
-      options: {{ plugins: {{ legend: {{ position: "bottom", labels: {{ font: {{ size: 10 }} }} }} }}, scales: {{ x: {{ stacked: true }}, y: {{ stacked: true, beginAtZero: true }} }} }}
+      options: {{
+        plugins: {{
+          legend: {{ position: "bottom", labels: {{ font: {{ size: 10 }} }} }},
+          tooltip: {{
+            callbacks: {{
+              label: function(ctx) {{
+                const t = allTypes[ctx.datasetIndex];
+                const v = ctx.parsed.y != null ? ctx.parsed.y : ctx.parsed;
+                const month = ms[ctx.dataIndex];
+                const monthTotal = allRows.filter(r => r.month === month).length;
+                const pct = monthTotal ? (100 * v / monthTotal) : 0;
+                return humanize(t) + ": " + fmtNum(v) + " (" + pct.toFixed(1) + "% of bad orders in that month)";
+              }}
+            }}
+          }}
+        }},
+        scales: {{ x: {{ stacked: true }}, y: {{ stacked: true, beginAtZero: true }} }}
+      }}
     }});
 
-    // Rate trend
-    const segAll = b === "all" ? (DATA.segment_trend || []) : ((DATA.segment_trend_by_cohort || {{}})[b] || []);
-    const seg = segAll.filter(r => ms.includes(r.month));
+    // Rate trend (recomputed for brand + account management filters)
+    const seg = buildSegmentTrendRows(ms);
     destroyChart("segTrend");
     charts.segTrend = new Chart(document.getElementById("chSegTrend"), {{
       type: "line",
@@ -498,16 +607,52 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
       options: {{ plugins: {{ legend: {{ position: "bottom", labels: {{ font: {{ size: 10 }} }} }} }} }}
     }});
 
-    // Type bar
+    // Type bar (count + % of all bad orders in current filters)
     const rows = filteredRows();
+    const totalBad = rows.length;
     const typeCounts = {{}};
     rows.forEach(r => {{ typeCounts[r.type] = (typeCounts[r.type] || 0) + 1; }});
     const sortedTypes = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
     destroyChart("typeBar");
     charts.typeBar = new Chart(document.getElementById("chTypeBar"), {{
       type: "bar",
-      data: {{ labels: sortedTypes.map(x => humanize(x[0])), datasets: [{{ label: "Count", data: sortedTypes.map(x => x[1]), backgroundColor: C.green + "99" }}] }},
-      options: {{ indexAxis: "y", plugins: {{ legend: {{ display: false }} }}, scales: {{ x: {{ beginAtZero: true }} }} }}
+      data: {{
+        labels: sortedTypes.map(x => humanize(x[0])),
+        datasets: [{{ label: "Bad orders", data: sortedTypes.map(x => x[1]), backgroundColor: C.green + "99" }}]
+      }},
+      options: {{
+        indexAxis: "y",
+        plugins: {{
+          legend: {{ display: false }},
+          tooltip: {{
+            callbacks: {{
+              label: function(ctx) {{
+                const v = ctx.parsed.x != null ? ctx.parsed.x : ctx.parsed;
+                const pct = totalBad ? (100 * v / totalBad) : 0;
+                return fmtNum(v) + " (" + pct.toFixed(1) + "% of filtered bad orders)";
+              }}
+            }}
+          }}
+        }},
+        layout: {{ padding: {{ right: 100 }} }},
+        scales: {{ x: {{ beginAtZero: true }} }}
+      }},
+      plugins: [{{
+        id: "badorders-typebar-pct",
+        afterDatasetsDraw(chart) {{
+          const ctx = chart.ctx;
+          chart.data.datasets[0].data.forEach((val, i) => {{
+            const meta = chart.getDatasetMeta(0).data[i];
+            if (!meta) return;
+            const pct = totalBad ? (100 * val / totalBad) : 0;
+            ctx.save();
+            ctx.fillStyle = "#333"; ctx.font = "bold 11px sans-serif";
+            ctx.textAlign = "left"; ctx.textBaseline = "middle";
+            ctx.fillText(fmtNum(val) + " (" + pct.toFixed(1) + "%)", meta.x + 6, meta.y);
+            ctx.restore();
+          }});
+        }}
+      }}]
     }});
 
     // Provider bar
@@ -518,15 +663,19 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
     charts.provBar = new Chart(document.getElementById("chProvBar"), {{
       type: "bar",
       data: {{ labels: sortedProvs.map(x => x[0]), datasets: [{{ label: "Bad orders", data: sortedProvs.map(x => x[1]), backgroundColor: C.red + "88" }}] }},
-      options: {{ indexAxis: "y", plugins: {{ legend: {{ display: false }} }}, scales: {{ x: {{ beginAtZero: true }} }} }},
+      options: {{ indexAxis: "y", plugins: {{ legend: {{ display: false }} }}, layout: {{ padding: {{ right: 56 }} }}, scales: {{ x: {{ beginAtZero: true }} }} }},
       plugins: [{{
+        id: "badorders-provbar-count",
         afterDatasetsDraw(chart) {{
           const ctx = chart.ctx;
           chart.data.datasets[0].data.forEach((val, i) => {{
             const meta = chart.getDatasetMeta(0).data[i];
+            if (!meta) return;
+            ctx.save();
             ctx.fillStyle = "#333"; ctx.font = "bold 11px sans-serif";
             ctx.textAlign = "left"; ctx.textBaseline = "middle";
             ctx.fillText(fmtNum(val), meta.x + 6, meta.y);
+            ctx.restore();
           }});
         }}
       }}]
@@ -535,11 +684,11 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
 
   function renderKpiTable() {{
     const b = activeBrand();
-    const rows = DATA.kpi_by_provider.filter(r => b === "all" || r.cohort === b);
-    let html = "<table class='data'><thead><tr><th>Provider</th><th>Placed</th><th>Bad orders</th><th>Bad rate</th><th>Rejected %</th><th>Not deliv %</th><th>Late 15+ %</th><th>Missing/wrong %</th></tr></thead><tbody>";
+    const rows = DATA.kpi_by_provider.filter(r => (b === "all" || r.cohort === b) && matchesAm(r));
+    let html = "<table class='data'><thead><tr><th>Provider</th><th>Account mgmt</th><th>Placed</th><th>Bad orders</th><th>Bad rate</th><th>Rejected %</th><th>Not deliv %</th><th>Late 15+ %</th><th>Missing/wrong %</th></tr></thead><tbody>";
     rows.forEach(r => {{
       const cls = (r.bad_rate || 0) > 0.05 ? " class='highlight'" : "";
-      html += "<tr" + cls + "><td>" + r.provider + "</td><td>" + fmtNum(r.placed_orders) + "</td><td>" + fmtNum(r.bad_orders) + "</td><td>" + fmtPct(r.bad_rate) + "</td><td>" + fmtPct(r.rejected_rate) + "</td><td>" + fmtPct(r.not_delivered_rate) + "</td><td>" + fmtPct(r.late_15_rate) + "</td><td>" + fmtPct(r.missing_wrong_rate) + "</td></tr>";
+      html += "<tr" + cls + "><td>" + r.provider + "</td><td>" + humanize(rowAm(r)) + "</td><td>" + fmtNum(r.placed_orders) + "</td><td>" + fmtNum(r.bad_orders) + "</td><td>" + fmtPct(r.bad_rate) + "</td><td>" + fmtPct(r.rejected_rate) + "</td><td>" + fmtPct(r.not_delivered_rate) + "</td><td>" + fmtPct(r.late_15_rate) + "</td><td>" + fmtPct(r.missing_wrong_rate) + "</td></tr>";
     }});
     html += "</tbody></table>";
     document.getElementById("tableKpi").innerHTML = html;
@@ -548,7 +697,7 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
   function renderRejectedKpis() {{
     const ms = activeMonths();
     const b = activeBrand();
-    const rej = DATA.rejection_data.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b));
+    const rej = DATA.rejection_data.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b) && matchesAm(r));
     let totalRej = 0, totalDnr = 0, totalPlaced = 0;
     rej.forEach(r => {{ totalRej += r.rejected || 0; totalDnr += r.dnr || 0; totalPlaced += r.placed_orders || 0; }});
     const el = document.getElementById("kpiRejected");
@@ -563,7 +712,7 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
   function renderRejectedTable() {{
     const ms = activeMonths();
     const b = activeBrand();
-    const rej = DATA.rejection_data.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b));
+    const rej = DATA.rejection_data.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b) && matchesAm(r));
     const byProv = {{}};
     rej.forEach(r => {{
       if (!byProv[r.provider]) byProv[r.provider] = {{ placed: 0, rejected: 0, dnr: 0 }};
@@ -611,11 +760,25 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
     const typeCounts = {{}};
     rows.forEach(r => {{ typeCounts[r.type] = (typeCounts[r.type] || 0) + 1; }});
     const tSorted = Object.entries(typeCounts).sort((a,b) => b[1] - a[1]);
+    const badTotal = rows.length;
     destroyChart("typePie");
     charts.typePie = new Chart(document.getElementById("chTypePie"), {{
       type: "doughnut",
       data: {{ labels: tSorted.map(x => humanize(x[0])), datasets: [{{ data: tSorted.map(x => x[1]), backgroundColor: C.palette.slice(0, tSorted.length) }}] }},
-      options: {{ plugins: {{ legend: {{ position: "bottom", labels: {{ font: {{ size: 10 }} }} }} }} }}
+      options: {{
+        plugins: {{
+          legend: {{ position: "bottom", labels: {{ font: {{ size: 10 }} }} }},
+          tooltip: {{
+            callbacks: {{
+              label: function(ctx) {{
+                const v = ctx.parsed;
+                const pct = badTotal ? (100 * v / badTotal) : 0;
+                return fmtNum(v) + " (" + pct.toFixed(1) + "% of filtered bad orders)";
+              }}
+            }}
+          }}
+        }}
+      }}
     }});
   }}
 
@@ -647,9 +810,9 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
   function renderRecent() {{
     const limit = DATA.recent_limit || 100;
     const rows = filteredRows().slice(0, limit);
-    let html = "<table class='data'><thead><tr><th>Time</th><th>Ref</th><th>Provider</th><th>Type</th><th>Reason</th></tr></thead><tbody>";
+    let html = "<table class='data'><thead><tr><th>Time</th><th>Ref</th><th>Provider</th><th>Account mgmt</th><th>Type</th><th>Reason</th></tr></thead><tbody>";
     rows.forEach(r => {{
-      html += "<tr><td>" + r.time + "</td><td>" + r.order_ref + "</td><td>" + r.provider + "</td><td>" + humanize(r.type) + "</td><td>" + humanize(r.reason) + "</td></tr>";
+      html += "<tr><td>" + r.time + "</td><td>" + r.order_ref + "</td><td>" + r.provider + "</td><td>" + humanize(rowAm(r)) + "</td><td>" + humanize(r.type) + "</td><td>" + humanize(r.reason) + "</td></tr>";
     }});
     html += "</tbody></table>";
     document.getElementById("tableRecent").innerHTML = html;
@@ -669,6 +832,7 @@ def _html_template(title: str, account_options_html: str, month_options_html: st
 
   document.getElementById("monthSel").addEventListener("change", refresh);
   document.getElementById("brandSel").addEventListener("change", refresh);
+  document.getElementById("amSel").addEventListener("change", refresh);
 
   document.querySelectorAll("#mainTabs .tab").forEach(btn => {{
     btn.addEventListener("click", () => {{
@@ -753,6 +917,10 @@ def main() -> int:
         kpi_df = dbx.query(_query_kpi_by_provider_sql(filters))
         rejection_df = dbx.query(_query_rejection_data_sql(filters))
 
+    for _df in (detail_df, rejection_df, kpi_df):
+        if not _df.empty and "account_manager" not in _df.columns:
+            _df["account_manager"] = "Unknown"
+
     accounts = _records(accounts_df)
     detail_rows = _records(detail_df)
     kpi_by_provider = _records(kpi_df)
@@ -767,6 +935,16 @@ def main() -> int:
     )
     month_options_html = "<option value=\"all\">All months</option>" + "".join(
         f"<option value=\"{m}\">{month_labels.get(m, m)}</option>" for m in months
+    )
+
+    am_values: set[str] = set()
+    if not kpi_df.empty and "account_manager" in kpi_df.columns:
+        am_values.update(str(x) for x in kpi_df["account_manager"].fillna("Unknown").unique())
+    elif not rejection_df.empty and "account_manager" in rejection_df.columns:
+        am_values.update(str(x) for x in rejection_df["account_manager"].fillna("Unknown").unique())
+    am_list = sorted(am_values)
+    am_options_html = "<option value=\"all\">All account managers</option>" + "".join(
+        f"<option value=\"{html_lib.escape(x, quote=True)}\">{html_lib.escape(x)}</option>" for x in am_list
     )
 
     # Precompute segment trends overall and by cohort for fast client-side rendering.
@@ -873,7 +1051,13 @@ def main() -> int:
     }
 
     data_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    html = _html_template(title=title, account_options_html=account_options_html, month_options_html=month_options_html, data_json=data_json)
+    html = _html_template(
+        title=title,
+        account_options_html=account_options_html,
+        am_options_html=am_options_html,
+        month_options_html=month_options_html,
+        data_json=data_json,
+    )
 
     output_arg = args.output
     if not output_arg:
