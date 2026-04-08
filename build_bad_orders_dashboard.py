@@ -185,7 +185,7 @@ def _vendor_filter_sql(filters: Filters, table_alias: str = "d") -> str:
 
 
 def _from_order_with_provider_sql() -> str:
-    """Join orders to merchant dimension for account management (AM) assignment."""
+    """Join orders to merchant dimension for AM owner (account manager name)."""
     return (
         "FROM ng_delivery_spark.dim_order_delivery d\n"
         "LEFT JOIN ng_delivery_spark.dim_provider_v2 p ON d.provider_id = p.provider_id\n"
@@ -212,9 +212,35 @@ def _bad_orders_where_sql(filters: Filters) -> str:
     )
 
 
-def _account_manager_sql() -> str:
-    """AM assignment from merchant master (team / bucket, not necessarily a person's name)."""
-    return "COALESCE(NULLIF(TRIM(p.account_management_segment), ''), 'Unknown')"
+def _am_owner_sql() -> str:
+    """Account manager (person) from merchant master."""
+    return "COALESCE(NULLIF(TRIM(p.account_manager_name), ''), 'Unknown')"
+
+
+# Malta Food: preferred dropdown order (must match dim_provider_v2.account_manager_name).
+_MT_AM_OWNER_PRIMARY_ORDER: tuple[str, ...] = (
+    "Yousef Moungad",
+    "Alena Tokareva",
+    "Gulcin Erguven",
+    "Duncan Calleja",
+)
+
+
+def _am_owner_dropdown_list(am_values: set[str], country_code: str) -> list[str]:
+    """Order AM owner options: primary roster first, then remaining names A–Z, then Unknown."""
+    cc = country_code.lower()
+    primary = _MT_AM_OWNER_PRIMARY_ORDER if cc == "mt" else ()
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in primary:
+        if name in am_values and name not in seen:
+            out.append(name)
+            seen.add(name)
+    rest = sorted((x for x in am_values if x not in seen and x != "Unknown"), key=lambda s: str(s).lower())
+    out.extend(rest)
+    if "Unknown" in am_values:
+        out.append("Unknown")
+    return out
 
 
 def _reason_sql() -> str:
@@ -269,7 +295,7 @@ def _query_detail_rows_sql(filters: Filters) -> str:
         "  d.order_reference_id AS order_ref,\n"
         "  d.provider_name AS provider,\n"
         "  COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
-        f"  {_account_manager_sql()} AS account_manager,\n"
+        f"  {_am_owner_sql()} AS am_owner,\n"
         "  d.bad_order_type AS type,\n"
         f"  {reason_d} AS reason\n"
         + _from_order_with_provider_sql()
@@ -284,7 +310,7 @@ def _query_kpi_by_provider_sql(filters: Filters) -> str:
         "  SELECT\n"
         "    d.provider_name AS provider,\n"
         "    COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
-        f"    {_account_manager_sql()} AS account_manager,\n"
+        f"    {_am_owner_sql()} AS am_owner,\n"
         "    COUNT(*) AS placed_orders,\n"
         "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' THEN 1 ELSE 0 END) AS bad_orders,\n"
         "    SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'failed_order_provider_rejected' THEN 1 ELSE 0 END) AS rejected_orders,\n"
@@ -296,13 +322,13 @@ def _query_kpi_by_provider_sql(filters: Filters) -> str:
         + _from_order_with_provider_sql()
         + _base_where_sql(filters)
         + "  GROUP BY d.provider_name, COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown'), "
-        + _account_manager_sql()
+        + _am_owner_sql()
         + "\n"
         ")\n"
         "SELECT\n"
         "  provider,\n"
         "  cohort,\n"
-        "  account_manager,\n"
+        "  am_owner,\n"
         "  placed_orders,\n"
         "  bad_orders,\n"
         "  CASE WHEN placed_orders > 0 THEN bad_orders / placed_orders ELSE NULL END AS bad_rate,\n"
@@ -323,7 +349,7 @@ def _query_rejection_data_sql(filters: Filters) -> str:
         "SELECT\n"
         "  d.provider_name AS provider,\n"
         "  COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown') AS cohort,\n"
-        f"  {_account_manager_sql()} AS account_manager,\n"
+        f"  {_am_owner_sql()} AS am_owner,\n"
         "  date_format(d.order_created_date_local, 'yyyy-MM') AS month,\n"
         "  COUNT(*) AS placed_orders,\n"
         "  SUM(CASE WHEN d.is_bad_order = true AND d.bad_order_actor_at_fault = 'provider' AND d.bad_order_type = 'failed_order_provider_rejected' THEN 1 ELSE 0 END) AS rejected,\n"
@@ -331,7 +357,7 @@ def _query_rejection_data_sql(filters: Filters) -> str:
         + _from_order_with_provider_sql()
         + _base_where_sql(filters)
         + "GROUP BY d.provider_name, COALESCE(NULLIF(TRIM(d.vendor_name), ''), 'Unknown'), "
-        + _account_manager_sql()
+        + _am_owner_sql()
         + ", date_format(d.order_created_date_local, 'yyyy-MM')\n"
         + "ORDER BY month DESC, rejected DESC\n"
     )
@@ -408,7 +434,7 @@ def _html_template(
 <body>
   <header>
     <h1>{title}</h1>
-    <div class="sub">Provider-at-fault bad orders — orders from `dim_order_delivery`; account management from `dim_provider_v2.account_management_segment` (AM assignment / team)</div>
+    <div class="sub">Provider-at-fault bad orders — orders from `dim_order_delivery`; AM owner from `dim_provider_v2.account_manager_name`</div>
   </header>
   <div class="wrap">
     <div class="filters">
@@ -417,7 +443,7 @@ def _html_template(
           {account_options_html}
         </select>
       </label>
-      <label>Account management:
+      <label>AM owner:
         <select id="amSel">
           {am_options_html}
         </select>
@@ -442,7 +468,7 @@ def _html_template(
         <div class="panel"><h2>Bad order rates (trend)</h2><canvas id="chSegTrend"></canvas></div>
       </div>
       <div class="grid2">
-        <div class="panel"><h2>Bad orders by type</h2><p class="sub" style="font-size:0.8rem;color:var(--bolt-muted);margin:-0.25rem 0 0.5rem">Labels show count and % of all bad orders in the current filters (Brand / Account management / Month).</p><canvas id="chTypeBar"></canvas></div>
+        <div class="panel"><h2>Bad orders by type</h2><p class="sub" style="font-size:0.8rem;color:var(--bolt-muted);margin:-0.25rem 0 0.5rem">Labels show count and % of all bad orders in the current filters (Brand / AM owner / Month).</p><canvas id="chTypeBar"></canvas></div>
         <div class="panel"><h2>Bad orders by provider</h2><canvas id="chProvBar"></canvas></div>
       </div>
       <div class="panel"><h2>Provider KPIs</h2><div style="overflow:auto" id="tableKpi"></div></div>
@@ -480,7 +506,7 @@ def _html_template(
   function activeMonths() {{ const v = document.getElementById("monthSel").value; return v === "all" ? MONTHS : [v]; }}
   function activeBrand() {{ return document.getElementById("brandSel").value; }}
   function activeAm() {{ return document.getElementById("amSel").value; }}
-  function rowAm(r) {{ return r.account_manager != null ? String(r.account_manager) : "Unknown"; }}
+  function rowAm(r) {{ return r.am_owner != null ? String(r.am_owner) : "Unknown"; }}
   function matchesAm(r) {{ const a = activeAm(); return a === "all" || rowAm(r) === a; }}
 
   function filteredRows() {{
@@ -489,7 +515,7 @@ def _html_template(
     return DATA.detail_rows.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b) && matchesAm(r));
   }}
 
-  /** Rate trend rows for selected brand + account management (computed client-side from raw rows). */
+  /** Rate trend rows for selected brand + AM owner (computed client-side from raw rows). */
   function buildSegmentTrendRows(ms) {{
     const b = activeBrand();
     const a = activeAm();
@@ -590,7 +616,7 @@ def _html_template(
       }}
     }});
 
-    // Rate trend (recomputed for brand + account management filters)
+    // Rate trend (recomputed for brand + AM owner filters)
     const seg = buildSegmentTrendRows(ms);
     destroyChart("segTrend");
     charts.segTrend = new Chart(document.getElementById("chSegTrend"), {{
@@ -685,7 +711,7 @@ def _html_template(
   function renderKpiTable() {{
     const b = activeBrand();
     const rows = DATA.kpi_by_provider.filter(r => (b === "all" || r.cohort === b) && matchesAm(r));
-    let html = "<table class='data'><thead><tr><th>Provider</th><th>Account mgmt</th><th>Placed</th><th>Bad orders</th><th>Bad rate</th><th>Rejected %</th><th>Not deliv %</th><th>Late 15+ %</th><th>Missing/wrong %</th></tr></thead><tbody>";
+    let html = "<table class='data'><thead><tr><th>Provider</th><th>AM owner</th><th>Placed</th><th>Bad orders</th><th>Bad rate</th><th>Rejected %</th><th>Not deliv %</th><th>Late 15+ %</th><th>Missing/wrong %</th></tr></thead><tbody>";
     rows.forEach(r => {{
       const cls = (r.bad_rate || 0) > 0.05 ? " class='highlight'" : "";
       html += "<tr" + cls + "><td>" + r.provider + "</td><td>" + humanize(rowAm(r)) + "</td><td>" + fmtNum(r.placed_orders) + "</td><td>" + fmtNum(r.bad_orders) + "</td><td>" + fmtPct(r.bad_rate) + "</td><td>" + fmtPct(r.rejected_rate) + "</td><td>" + fmtPct(r.not_delivered_rate) + "</td><td>" + fmtPct(r.late_15_rate) + "</td><td>" + fmtPct(r.missing_wrong_rate) + "</td></tr>";
@@ -810,7 +836,7 @@ def _html_template(
   function renderRecent() {{
     const limit = DATA.recent_limit || 100;
     const rows = filteredRows().slice(0, limit);
-    let html = "<table class='data'><thead><tr><th>Time</th><th>Ref</th><th>Provider</th><th>Account mgmt</th><th>Type</th><th>Reason</th></tr></thead><tbody>";
+    let html = "<table class='data'><thead><tr><th>Time</th><th>Ref</th><th>Provider</th><th>AM owner</th><th>Type</th><th>Reason</th></tr></thead><tbody>";
     rows.forEach(r => {{
       html += "<tr><td>" + r.time + "</td><td>" + r.order_ref + "</td><td>" + r.provider + "</td><td>" + humanize(rowAm(r)) + "</td><td>" + humanize(r.type) + "</td><td>" + humanize(r.reason) + "</td></tr>";
     }});
@@ -918,8 +944,8 @@ def main() -> int:
         rejection_df = dbx.query(_query_rejection_data_sql(filters))
 
     for _df in (detail_df, rejection_df, kpi_df):
-        if not _df.empty and "account_manager" not in _df.columns:
-            _df["account_manager"] = "Unknown"
+        if not _df.empty and "am_owner" not in _df.columns:
+            _df["am_owner"] = "Unknown"
 
     accounts = _records(accounts_df)
     detail_rows = _records(detail_df)
@@ -938,12 +964,14 @@ def main() -> int:
     )
 
     am_values: set[str] = set()
-    if not kpi_df.empty and "account_manager" in kpi_df.columns:
-        am_values.update(str(x) for x in kpi_df["account_manager"].fillna("Unknown").unique())
-    elif not rejection_df.empty and "account_manager" in rejection_df.columns:
-        am_values.update(str(x) for x in rejection_df["account_manager"].fillna("Unknown").unique())
-    am_list = sorted(am_values)
-    am_options_html = "<option value=\"all\">All account managers</option>" + "".join(
+    if not kpi_df.empty and "am_owner" in kpi_df.columns:
+        am_values.update(str(x) for x in kpi_df["am_owner"].fillna("Unknown").unique())
+    elif not rejection_df.empty and "am_owner" in rejection_df.columns:
+        am_values.update(str(x) for x in rejection_df["am_owner"].fillna("Unknown").unique())
+    if filters.country_code.lower() == "mt":
+        am_values.update(_MT_AM_OWNER_PRIMARY_ORDER)
+    am_list = _am_owner_dropdown_list(am_values, filters.country_code)
+    am_options_html = "<option value=\"all\">All AM owners</option>" + "".join(
         f"<option value=\"{html_lib.escape(x, quote=True)}\">{html_lib.escape(x)}</option>" for x in am_list
     )
 
