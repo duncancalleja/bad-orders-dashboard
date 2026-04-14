@@ -744,7 +744,15 @@ def _html_template(
           }}
         }},
         layout: {{ padding: {{ right: 118 }} }},
-        scales: {{ x: {{ beginAtZero: true }} }}
+        scales: {{
+          x: {{ beginAtZero: true }},
+          y: {{
+            ticks: {{
+              autoSkip: false,
+              maxRotation: 0,
+            }}
+          }}
+        }}
       }},
       plugins: [{{
         id: "badorders-provbar-count",
