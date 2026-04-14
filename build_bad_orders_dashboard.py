@@ -724,7 +724,7 @@ def _html_template(
             const name = sortedProvs[i][0];
             const placed = placedByProv[name] || 0;
             const pct = placed ? (100 * val / placed) : null;
-            const suffix = pct != null ? " (" + pct.toFixed(1) + "% of orders)" : "";
+            const suffix = pct != null ? " (" + pct.toFixed(1) + "% of total orders)" : "";
             ctx.save();
             ctx.fillStyle = "#333"; ctx.font = "bold 11px sans-serif";
             ctx.textAlign = "left"; ctx.textBaseline = "middle";
