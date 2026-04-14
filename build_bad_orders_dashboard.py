@@ -421,6 +421,9 @@ def _html_template(
     table.data th, table.data td {{ border-bottom: 1px solid var(--bolt-border); padding: .4rem .6rem; text-align: right; white-space: nowrap; }}
     table.data th:first-child, table.data td:first-child {{ text-align: left; }}
     table.data th {{ background: #fafcfa; color: var(--bolt-muted); font-weight: 600; }}
+    table.data th.sortable {{ cursor: pointer; user-select: none; color: var(--bolt-green-dark); }}
+    table.data th.sortable:hover {{ background: #eef7f1; }}
+    table.data th.sortable .sort-ind {{ font-size: .65rem; margin-left: .2rem; opacity: .85; }}
     tr.highlight td {{ background: #fff3f3; }}
     .section-hidden {{ display: none !important; }}
     .leak-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: .75rem; }}
@@ -560,7 +563,33 @@ def _html_template(
   }}
 
   let charts = {{}};
+  /** KPI table sort: click header to sort (toggle ↑/↓). */
+  let kpiSort = {{ key: "bad_orders", dir: "desc" }};
+
   function destroyChart(id) {{ if (charts[id]) {{ charts[id].destroy(); delete charts[id]; }} }}
+
+  function kpiSortVal(r, key) {{
+    const v = r[key];
+    if (v == null || (typeof v === "number" && isNaN(v))) return null;
+    return Number(v);
+  }}
+
+  function kpiCompareRows(a, b) {{
+    const key = kpiSort.key;
+    const dir = kpiSort.dir;
+    const va = kpiSortVal(a, key);
+    const vb = kpiSortVal(b, key);
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    const c = va - vb;
+    return dir === "desc" ? -c : c;
+  }}
+
+  function kpiSortMark(colKey) {{
+    if (kpiSort.key !== colKey) return "";
+    return '<span class="sort-ind">' + (kpiSort.dir === "desc" ? "▼" : "▲") + "</span>";
+  }}
 
   const C = {{
     green: "#2A9C64", dark: "#1e7a4d", red: "#e53935", orange: "#fb8c00",
@@ -778,8 +807,16 @@ def _html_template(
 
   function renderKpiTable() {{
     const b = activeBrand();
-    const rows = DATA.kpi_by_provider.filter(r => (b === "all" || r.cohort === b) && matchesAm(r));
-    let html = "<table class='data'><thead><tr><th>Provider</th><th>AM owner</th><th>Placed</th><th>Bad orders</th><th>Bad rate</th><th>Rejected %</th><th>Not deliv %</th><th>Late 15+ %</th><th>Missing/wrong %</th></tr></thead><tbody>";
+    const rows = DATA.kpi_by_provider.filter(r => (b === "all" || r.cohort === b) && matchesAm(r)).sort(kpiCompareRows);
+    let html = "<table class='data'><thead><tr>"
+      + "<th>Provider</th><th>AM owner</th><th>Placed</th>"
+      + '<th class="sortable" data-kpi-sort="bad_orders" title="Click to sort">Bad orders' + kpiSortMark("bad_orders") + "</th>"
+      + '<th class="sortable" data-kpi-sort="bad_rate" title="Click to sort">Bad rate' + kpiSortMark("bad_rate") + "</th>"
+      + '<th class="sortable" data-kpi-sort="rejected_rate" title="Click to sort">Rejected %' + kpiSortMark("rejected_rate") + "</th>"
+      + '<th class="sortable" data-kpi-sort="not_delivered_rate" title="Click to sort">Not deliv %' + kpiSortMark("not_delivered_rate") + "</th>"
+      + '<th class="sortable" data-kpi-sort="late_15_rate" title="Click to sort">Late 15+ %' + kpiSortMark("late_15_rate") + "</th>"
+      + '<th class="sortable" data-kpi-sort="missing_wrong_rate" title="Click to sort">Missing/wrong %' + kpiSortMark("missing_wrong_rate") + "</th>"
+      + "</tr></thead><tbody>";
     rows.forEach(r => {{
       const cls = (r.bad_rate || 0) > 0.05 ? " class='highlight'" : "";
       html += "<tr" + cls + "><td>" + r.provider + "</td><td>" + humanize(rowAm(r)) + "</td><td>" + fmtNum(r.placed_orders) + "</td><td>" + fmtNum(r.bad_orders) + "</td><td>" + fmtPct(r.bad_rate) + "</td><td>" + fmtPct(r.rejected_rate) + "</td><td>" + fmtPct(r.not_delivered_rate) + "</td><td>" + fmtPct(r.late_15_rate) + "</td><td>" + fmtPct(r.missing_wrong_rate) + "</td></tr>";
@@ -928,6 +965,20 @@ def _html_template(
   document.getElementById("brandSel").addEventListener("change", refresh);
   document.getElementById("amSel").addEventListener("change", refresh);
   document.getElementById("provSortSel").addEventListener("change", refresh);
+
+  document.getElementById("tableKpi").addEventListener("click", function(ev) {{
+    const th = ev.target.closest("th.sortable");
+    if (!th) return;
+    const key = th.getAttribute("data-kpi-sort");
+    if (!key) return;
+    if (kpiSort.key === key) {{
+      kpiSort.dir = kpiSort.dir === "desc" ? "asc" : "desc";
+    }} else {{
+      kpiSort.key = key;
+      kpiSort.dir = "desc";
+    }}
+    renderKpiTable();
+  }});
 
   document.querySelectorAll("#mainTabs .tab").forEach(btn => {{
     btn.addEventListener("click", () => {{
