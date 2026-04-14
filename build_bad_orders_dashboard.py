@@ -705,13 +705,12 @@ def _html_template(
                 const bad = sortedProvs[ctx.dataIndex][1];
                 const placed = placedByProv[name] || 0;
                 const pct = placed ? (100 * bad / placed) : null;
-                const pctStr = pct != null ? pct.toFixed(1) + "% of total orders" : "—";
-                return fmtNum(bad) + " bad · " + pctStr;
+                return pct != null ? pct.toFixed(1) + "%" : "—";
               }}
             }}
           }}
         }},
-        layout: {{ padding: {{ right: 140 }} }},
+        layout: {{ padding: {{ right: 52 }} }},
         scales: {{ x: {{ beginAtZero: true }} }}
       }},
       plugins: [{{
@@ -724,11 +723,11 @@ def _html_template(
             const name = sortedProvs[i][0];
             const placed = placedByProv[name] || 0;
             const pct = placed ? (100 * val / placed) : null;
-            const suffix = pct != null ? " (" + pct.toFixed(1) + "% of total orders)" : "";
+            const label = pct != null ? pct.toFixed(1) + "%" : "—";
             ctx.save();
             ctx.fillStyle = "#333"; ctx.font = "bold 11px sans-serif";
             ctx.textAlign = "left"; ctx.textBaseline = "middle";
-            ctx.fillText(fmtNum(val) + suffix, meta.x + 6, meta.y);
+            ctx.fillText(label, meta.x + 6, meta.y);
             ctx.restore();
           }});
         }}
