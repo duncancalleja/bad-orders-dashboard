@@ -429,6 +429,10 @@ def _html_template(
     .leak-block .leak-total {{ color: var(--bolt-muted); font-weight: 600; }}
     .leak-block table.data {{ font-size: .78rem; }}
     .leak-block table.data th, .leak-block table.data td {{ padding: .25rem .4rem; }}
+    .panel-head {{ display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .5rem 1rem; margin-bottom: .5rem; }}
+    .panel-head h2 {{ margin: 0; }}
+    .panel-head .inline-sort {{ font-size: .8rem; color: var(--bolt-muted); white-space: nowrap; }}
+    .panel-head .inline-sort select {{ margin-left: .35rem; padding: .25rem .5rem; border-radius: 8px; border: 1px solid var(--bolt-border); font-size: .8rem; }}
   </style>
 </head>
 <body>
@@ -469,7 +473,18 @@ def _html_template(
       </div>
       <div class="grid2">
         <div class="panel"><h2>Bad orders by type</h2><p class="sub" style="font-size:0.8rem;color:var(--bolt-muted);margin:-0.25rem 0 0.5rem">Labels show count and % of all bad orders in the current filters (Brand / AM owner / Month).</p><canvas id="chTypeBar"></canvas></div>
-        <div class="panel"><h2>Bad orders by provider</h2><canvas id="chProvBar"></canvas></div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Bad orders by provider</h2>
+            <label class="inline-sort">Sort by
+              <select id="provSortSel" title="Order providers in this chart">
+                <option value="total">Highest total</option>
+                <option value="pct">Highest %</option>
+              </select>
+            </label>
+          </div>
+          <canvas id="chProvBar"></canvas>
+        </div>
       </div>
       <div class="panel"><h2>Provider KPIs</h2><div style="overflow:auto" id="tableKpi"></div></div>
     </div>
@@ -506,6 +521,10 @@ def _html_template(
   function activeMonths() {{ const v = document.getElementById("monthSel").value; return v === "all" ? MONTHS : [v]; }}
   function activeBrand() {{ return document.getElementById("brandSel").value; }}
   function activeAm() {{ return document.getElementById("amSel").value; }}
+  function provSortMode() {{
+    const el = document.getElementById("provSortSel");
+    return el && el.value === "pct" ? "pct" : "total";
+  }}
   function rowAm(r) {{ return r.am_owner != null ? String(r.am_owner) : "Unknown"; }}
   function matchesAm(r) {{ const a = activeAm(); return a === "all" || rowAm(r) === a; }}
 
@@ -689,7 +708,21 @@ def _html_template(
       const p = r.provider;
       placedByProv[p] = (placedByProv[p] || 0) + (Number(r.placed_orders) || 0);
     }});
-    const sortedProvs = Object.entries(provCounts).filter(x => x[1] > 0).sort((a,b) => b[1] - a[1]).slice(0, 25);
+    const provEntries = Object.entries(provCounts).filter(x => x[1] > 0).map(([name, bad]) => {{
+      const placed = placedByProv[name] || 0;
+      const rate = placed > 0 ? bad / placed : 0;
+      return {{ name, bad, placed, rate }};
+    }});
+    const sortM = provSortMode();
+    provEntries.sort((a, b) => {{
+      if (sortM === "pct") {{
+        if (b.rate !== a.rate) return b.rate - a.rate;
+        return b.bad - a.bad;
+      }}
+      if (b.bad !== a.bad) return b.bad - a.bad;
+      return b.rate - a.rate;
+    }});
+    const sortedProvs = provEntries.slice(0, 25).map(x => [x.name, x.bad]);
     destroyChart("provBar");
     charts.provBar = new Chart(document.getElementById("chProvBar"), {{
       type: "bar",
@@ -704,13 +737,13 @@ def _html_template(
                 const name = sortedProvs[ctx.dataIndex][0];
                 const bad = sortedProvs[ctx.dataIndex][1];
                 const placed = placedByProv[name] || 0;
-                const pct = placed ? (100 * bad / placed) : null;
-                return pct != null ? pct.toFixed(1) + "%" : "—";
+                const pctStr = placed ? (100 * bad / placed).toFixed(1) + "%" : "—";
+                return fmtNum(bad) + " · " + pctStr;
               }}
             }}
           }}
         }},
-        layout: {{ padding: {{ right: 52 }} }},
+        layout: {{ padding: {{ right: 118 }} }},
         scales: {{ x: {{ beginAtZero: true }} }}
       }},
       plugins: [{{
@@ -722,8 +755,8 @@ def _html_template(
             if (!meta) return;
             const name = sortedProvs[i][0];
             const placed = placedByProv[name] || 0;
-            const pct = placed ? (100 * val / placed) : null;
-            const label = pct != null ? pct.toFixed(1) + "%" : "—";
+            const pctStr = placed ? (100 * val / placed).toFixed(1) + "%" : "—";
+            const label = fmtNum(val) + " · " + pctStr;
             ctx.save();
             ctx.fillStyle = "#333"; ctx.font = "bold 11px sans-serif";
             ctx.textAlign = "left"; ctx.textBaseline = "middle";
@@ -886,6 +919,7 @@ def _html_template(
   document.getElementById("monthSel").addEventListener("change", refresh);
   document.getElementById("brandSel").addEventListener("change", refresh);
   document.getElementById("amSel").addEventListener("change", refresh);
+  document.getElementById("provSortSel").addEventListener("change", refresh);
 
   document.querySelectorAll("#mainTabs .tab").forEach(btn => {{
     btn.addEventListener("click", () => {{
