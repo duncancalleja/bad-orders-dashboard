@@ -681,15 +681,39 @@ def _html_template(
       }}]
     }});
 
-    // Provider bar
+    // Provider bar (bad count + % of placed orders in same month/brand/AM filters)
     const provCounts = {{}};
     rows.forEach(r => {{ provCounts[r.provider] = (provCounts[r.provider] || 0) + 1; }});
+    const placedByProv = {{}};
+    DATA.rejection_data.filter(r => ms.includes(r.month) && (b === "all" || r.cohort === b) && matchesAm(r)).forEach(r => {{
+      const p = r.provider;
+      placedByProv[p] = (placedByProv[p] || 0) + (Number(r.placed_orders) || 0);
+    }});
     const sortedProvs = Object.entries(provCounts).filter(x => x[1] > 0).sort((a,b) => b[1] - a[1]).slice(0, 25);
     destroyChart("provBar");
     charts.provBar = new Chart(document.getElementById("chProvBar"), {{
       type: "bar",
       data: {{ labels: sortedProvs.map(x => x[0]), datasets: [{{ label: "Bad orders", data: sortedProvs.map(x => x[1]), backgroundColor: C.red + "88" }}] }},
-      options: {{ indexAxis: "y", plugins: {{ legend: {{ display: false }} }}, layout: {{ padding: {{ right: 56 }} }}, scales: {{ x: {{ beginAtZero: true }} }} }},
+      options: {{
+        indexAxis: "y",
+        plugins: {{
+          legend: {{ display: false }},
+          tooltip: {{
+            callbacks: {{
+              label: function(ctx) {{
+                const name = sortedProvs[ctx.dataIndex][0];
+                const bad = sortedProvs[ctx.dataIndex][1];
+                const placed = placedByProv[name] || 0;
+                const pct = placed ? (100 * bad / placed) : null;
+                const pctStr = pct != null ? pct.toFixed(1) + "% of total orders" : "—";
+                return fmtNum(bad) + " bad · " + pctStr;
+              }}
+            }}
+          }}
+        }},
+        layout: {{ padding: {{ right: 140 }} }},
+        scales: {{ x: {{ beginAtZero: true }} }}
+      }},
       plugins: [{{
         id: "badorders-provbar-count",
         afterDatasetsDraw(chart) {{
@@ -697,10 +721,14 @@ def _html_template(
           chart.data.datasets[0].data.forEach((val, i) => {{
             const meta = chart.getDatasetMeta(0).data[i];
             if (!meta) return;
+            const name = sortedProvs[i][0];
+            const placed = placedByProv[name] || 0;
+            const pct = placed ? (100 * val / placed) : null;
+            const suffix = pct != null ? " (" + pct.toFixed(1) + "% of orders)" : "";
             ctx.save();
             ctx.fillStyle = "#333"; ctx.font = "bold 11px sans-serif";
             ctx.textAlign = "left"; ctx.textBaseline = "middle";
-            ctx.fillText(fmtNum(val), meta.x + 6, meta.y);
+            ctx.fillText(fmtNum(val) + suffix, meta.x + 6, meta.y);
             ctx.restore();
           }});
         }}
